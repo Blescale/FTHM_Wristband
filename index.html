@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wristband monitor</title>
+<style>
+:root{--bg:#f2f5f3;--panel:#fff;--ink:#16302d;--mute:#5d7270;--line:#d8e0dd;--bad:#a6172e;--ok:#1f7a4d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 "Avenir Next","Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:900px;margin:0 auto;padding:16px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+h1{margin:0;font-size:1.5rem;font-weight:650;letter-spacing:-.01em}
+.sub{color:var(--mute);font-size:.9rem;margin:2px 0 0}
+.pills{display:flex;gap:6px;flex-wrap:wrap}
+.pill{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:3px 11px;font-size:.85rem}
+.pill.good{border-color:var(--ok);color:var(--ok)}
+.pill.warn{border-color:var(--bad);color:var(--bad)}
+#banner{display:none;background:var(--bad);color:#fff;padding:12px 14px;border-radius:8px;font-weight:650;margin-bottom:12px}
+#err{display:none;background:#fff4e5;border:1px solid #e0b060;padding:10px 12px;border-radius:8px;margin-bottom:12px}
+.vital{display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:center;background:var(--panel);border-left:6px solid var(--c);border-radius:6px;padding:10px 14px;margin-bottom:8px}
+.vital.bad{box-shadow:0 0 0 2px var(--bad)}
+.vital h2{margin:0;font-size:.95rem;font-weight:600;color:var(--mute)}
+.num{margin:0;font-size:2.6rem;font-weight:700;line-height:1.1}
+.num .u{font-size:.9rem;font-weight:500;color:var(--mute)}
+.age{margin:0;font-size:.8rem;color:var(--mute);min-height:1.2em}
+.vital.stale .num{color:#9aaaa8}
+canvas{width:100%;height:84px;display:block}
+.panel{background:var(--panel);border-radius:6px;padding:12px 14px;margin:14px 0}
+.panel h3{margin:0 0 4px;font-size:1rem}
+.hint{color:var(--mute);font-size:.85rem;margin:0 0 8px}
+.trow{display:grid;grid-template-columns:1.6fr 1fr 1fr;gap:8px;align-items:center;margin:6px 0;font-size:.9rem}
+input{width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;font:inherit}
+button{padding:9px 14px;border:0;border-radius:6px;background:var(--ink);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:3px solid #7fb3ff;outline-offset:2px}
+@media(max-width:560px){.vital{grid-template-columns:1fr}.num{font-size:2.2rem}}
+</style>
+</head>
+<body>
+<main>
+ <header>
+  <div>
+   <h1>Wristband monitor</h1>
+   <p class="sub"><span id="dev"></span> &middot; <span id="upd">Loading...</span></p>
+  </div>
+  <div class="pills">
+   <span class="pill" id="p_live">Checking...</span>
+   <span class="pill" id="p_wrist">--</span>
+   <span class="pill" id="p_ok">--</span>
+  </div>
+ </header>
+
+ <div id="banner"></div>
+ <div id="err"></div>
+ <div id="rows"></div>
+
+ <div class="panel">
+  <h3>Alert limits</h3>
+  <p class="hint">Leave a box empty to ignore that limit. A red banner appears when the last two readings are both outside a limit. Limits are saved in this browser only.</p>
+  <div id="throws"></div>
+  <button id="save">Save limits</button>
+  <span class="hint" id="saved"></span>
+ </div>
+ <p class="hint">Readings come from ThingSpeak and refresh every 20 seconds. The haemoglobin value is an uncalibrated index, and these numbers are screening hints, not a diagnosis.</p>
+</main>
+
+<script>
+// ---- SET THESE TWO VALUES ----
+const CONFIG = {
+  CHANNEL_ID: "YOUR_CHANNEL_ID",   // ThingSpeak channel ID (digits)
+  READ_KEY: "",                    // leave empty for a public channel. A key here is visible to anyone who views the page source.
+  DEVICE_NAME: "band-01",          // anonymous label, no patient names
+  REFRESH_MS: 20000, RESULTS: 90, STALE_S: 90, GAP_S: 75, HOLD: 2
+};
+
+// field numbers match the wristband sketch: 1 HR, 2 SpO2, 3 Hb index, 4 temp, 5 mic, 6 on wrist, 7 trusted
+const M = [
+  {id:'hr',   f:'field1', name:'Heart rate',        unit:'bpm',          d:0, color:'#b3304c', limits:true},
+  {id:'spo2', f:'field2', name:'Blood oxygen',      unit:'%',            d:0, color:'#1f5fa8', limits:true},
+  {id:'hb',   f:'field3', name:'Haemoglobin index', unit:'uncalibrated', d:1, color:'#6b4fa0', limits:true},
+  {id:'temp', f:'field4', name:'Temperature',       unit:'\u00b0C',      d:1, color:'#b7791f', limits:true},
+  {id:'noise',f:'field5', name:'Mic noise',         unit:'level',        d:0, color:'#4f6663', limits:false}
+];
+
+const $ = id => document.getElementById(id);
+let feeds = [];
+let th = {hr:{min:50,max:130}, spo2:{min:90,max:null}, hb:{min:null,max:null}, temp:{min:null,max:null}};
+try {
+  const s = localStorage.getItem('wb_th');
+  if (s) { const o = JSON.parse(s); Object.keys(th).forEach(k => { if (o[k]) th[k] = o[k]; }); }
+} catch (e) {}
+
+$('dev').textContent = CONFIG.DEVICE_NAME;
+
+M.forEach(m => {
+  const s = document.createElement('section');
+  s.className = 'vital'; s.id = 'r_' + m.id; s.style.setProperty('--c', m.color);
+  s.innerHTML = '<div><h2>' + m.name + '</h2><p class="num"><span class="v">--</span> <span class="u">' + m.unit + '</span></p><p class="age"></p></div><canvas></canvas>';
+  $('rows').appendChild(s);
+  if (m.limits) {
+    const r = document.createElement('div'); r.className = 'trow';
+    r.innerHTML = '<span>' + m.name + '</span><input type="number" step="any" placeholder="min" id="min_' + m.id + '"><input type="number" step="any" placeholder="max" id="max_' + m.id + '">';
+    $('throws').appendChild(r);
+    $('min_' + m.id).value = th[m.id].min == null ? '' : th[m.id].min;
+    $('max_' + m.id).value = th[m.id].max == null ? '' : th[m.id].max;
+  }
+});
+
+$('save').onclick = () => {
+  M.filter(m => m.limits).forEach(m => {
+    const a = $('min_' + m.id).value, b = $('max_' + m.id).value;
+    th[m.id] = {min: a === '' ? null : parseFloat(a), max: b === '' ? null : parseFloat(b)};
+  });
+  try { localStorage.setItem('wb_th', JSON.stringify(th)); } catch (e) {}
+  $('saved').textContent = ' Saved';
+  setTimeout(() => { $('saved').textContent = ''; }, 1500);
+  if (feeds.length) render();
+};
+
+function ago(s) {
+  if (s < 90) return Math.round(s) + ' s ago';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  return Math.round(s / 3600) + ' h ago';
+}
+function setPill(id, text, cls) { const p = $(id); p.textContent = text; p.className = 'pill' + (cls ? ' ' + cls : ''); }
+function showErr(t) { const e = $('err'); e.textContent = t; e.style.display = t ? 'block' : 'none'; }
+
+async function load() {
+  if (CONFIG.CHANNEL_ID === 'YOUR_CHANNEL_ID') { showErr('Set CHANNEL_ID at the top of the script in index.html.'); return; }
+  const url = 'https://api.thingspeak.com/channels/' + CONFIG.CHANNEL_ID + '/feeds.json?results=' + CONFIG.RESULTS +
+              (CONFIG.READ_KEY ? '&api_key=' + CONFIG.READ_KEY : '');
+  try {
+    const r = await fetch(url, {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    feeds = (j.feeds || []).map(f => {
+      const o = {t: Date.parse(f.created_at), wrist: f.field6 == 1, ok: f.field7 == 1};
+      M.forEach(m => { o[m.id] = f[m.f] == null ? null : parseFloat(f[m.f]); });
+      return o;
+    });
+    showErr('');
+    render();
+  } catch (e) {
+    showErr('Could not load the channel (' + e.message + '). Check the channel ID, and that the channel is shared with everyone or a Read API key is set.');
+  }
+}
+
+function render() {
+  const now = Date.now(), last = feeds[feeds.length - 1];
+  $('upd').textContent = last ? 'Last update ' + new Date(last.t).toLocaleTimeString() + ' (' + ago((now - last.t) / 1000) + ')' : 'No data yet';
+  const live = last && (now - last.t) / 1000 <= CONFIG.STALE_S;
+  setPill('p_live', live ? 'Band online' : 'Band offline', live ? 'good' : 'warn');
+  setPill('p_wrist', last && last.wrist ? 'On wrist' : 'Not on wrist', last && last.wrist ? 'good' : '');
+  setPill('p_ok', last && last.ok ? 'Reading trusted' : 'Reading not trusted', last && last.ok ? 'good' : '');
+
+  const bad = [];
+  M.forEach(m => {
+    const pts = feeds.filter(f => f[m.id] != null).map(f => ({t: f.t, v: f[m.id]}));
+    const row = $('r_' + m.id), lp = pts[pts.length - 1];
+    const age = lp ? (now - lp.t) / 1000 : null, stale = !lp || age > CONFIG.STALE_S;
+    row.querySelector('.v').textContent = lp ? lp.v.toFixed(m.d) : '--';
+    row.querySelector('.age').textContent = lp ? (stale ? 'Last valid reading ' + ago(age) : '') : 'No valid readings yet';
+    row.classList.toggle('stale', stale);
+    draw(row.querySelector('canvas'), pts, m);
+
+    let on = false;
+    if (m.limits && !stale) {
+      const t = th[m.id], recent = feeds.slice(-CONFIG.HOLD).map(f => f[m.id]);
+      if (recent.length === CONFIG.HOLD && recent.every(v => v != null)) {
+        if (t.min != null && recent.every(v => v < t.min)) { on = true; bad.push(m.name + ' ' + lp.v.toFixed(m.d) + ' is below ' + t.min); }
+        else if (t.max != null && recent.every(v => v > t.max)) { on = true; bad.push(m.name + ' ' + lp.v.toFixed(m.d) + ' is above ' + t.max); }
+      }
+    }
+    row.classList.toggle('bad', on);
+  });
+  const b = $('banner');
+  b.style.display = bad.length ? 'block' : 'none';
+  b.textContent = bad.length ? 'Check the patient: ' + bad.join(' | ') : '';
+  document.title = (bad.length ? 'ALERT - ' : '') + 'Wristband monitor';
+}
+
+function draw(cv, pts, m) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const c = cv.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
+  c.font = '12px system-ui,sans-serif'; c.fillStyle = '#5d7270';
+  if (!pts.length) { c.fillText('Waiting for readings', 4, h / 2); return; }
+
+  const t = m.limits ? th[m.id] : {min: null, max: null};
+  const vals = pts.map(p => p.v), dMin = Math.min(...vals), dMax = Math.max(...vals);
+  let lo = dMin, hi = dMax;
+  if (t.min != null) lo = Math.min(lo, t.min);
+  if (t.max != null) hi = Math.max(hi, t.max);
+  if (hi - lo < 1) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
+
+  const t0 = feeds[0].t, t1 = Math.max(feeds[feeds.length - 1].t, t0 + 1);
+  const X = tm => 4 + (w - 8) * (tm - t0) / (t1 - t0), Y = v => h - 4 - (h - 8) * (v - lo) / (hi - lo);
+
+  c.setLineDash([5, 4]); c.strokeStyle = '#a6172e'; c.lineWidth = 1;
+  [t.min, t.max].forEach(v => { if (v != null) { c.beginPath(); c.moveTo(0, Y(v)); c.lineTo(w, Y(v)); c.stroke(); } });
+
+  c.setLineDash([]); c.strokeStyle = m.color; c.lineWidth = 2; c.lineJoin = 'round';
+  c.beginPath();
+  pts.forEach((p, i) => {
+    const gap = i > 0 && (p.t - pts[i - 1].t) / 1000 > CONFIG.GAP_S;
+    if (i === 0 || gap) c.moveTo(X(p.t), Y(p.v)); else c.lineTo(X(p.t), Y(p.v));
+  });
+  c.stroke();
+
+  const lp = pts[pts.length - 1];
+  c.fillStyle = m.color; c.beginPath(); c.arc(X(lp.t), Y(lp.v), 3.5, 0, 7); c.fill();
+  c.fillStyle = '#5d7270';
+  c.fillText(dMax.toFixed(m.d), 6, 12);
+  c.fillText(dMin.toFixed(m.d), 6, h - 6);
+}
+
+load();
+setInterval(load, CONFIG.REFRESH_MS);
+setInterval(() => { if (feeds.length) render(); }, 5000);
+window.addEventListener('resize', () => { if (feeds.length) render(); });
+</script>
+</body>
+</html>
